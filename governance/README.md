@@ -322,5 +322,5 @@ the optional `crystal:intake`, `crystal:backlog`, and `mission:*` labels.
 - `.github/PULL_REQUEST_TEMPLATE.md` — PR template
 - `.github/workflows/enforce-conventions.yml` — title/labels validation (deterministic)
 - `.github/workflows/governance-check.yml` — pin + skills check
-- `.github/workflows/format-check.yml` — LLM-driven validation via GitHub Models (gpt-4o-mini), posts sticky comment with findings
+- `.github/workflows/format-check.yml` — LLM-driven validation via GitHub Copilot CLI (`auto`), posts a sticky verdict; see [migration and publication](../README.md#format-check-github-copilot-migration)
 - `skills/crystal-github-conventions/SKILL.md` — AI agents skill (universal Claude + Codex format, propagated to `.claude/skills/` and `.agents/skills/`)

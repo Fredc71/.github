@@ -1,6 +1,6 @@
 name: format-check
 # Reusable workflow: validates that a PR or issue conforms to Crystal
-# governance via the GitHub Models LLM (gpt-4o-mini by default).
+# governance via GitHub Copilot CLI (auto routing by default).
 # Posts a sticky comment with findings.
 #
 # Called from each Crystal repo:
@@ -11,40 +11,43 @@ name: format-check
 #       types: [opened, edited]
 #   jobs:
 #     check:
-#       uses: Malakof/.github/.github/workflows/format-check.yml@v1.2.0
+#       uses: Malakof/.github/.github/workflows/format-check.yml@vX.Y.Z
+#       # Replace vX.Y.Z with the published release containing this migration.
 #       permissions:
 #         contents: read
 #         pull-requests: write
 #         issues: write
-#         models: read
+#         copilot-requests: write
 
 on:
   workflow_call:
     inputs:
       blocking:
-        description: "true = fail the workflow when severity=fail; false = warning only."
+        description: "Controls valid format rejections; unavailable review always fails."
         required: false
         default: false
         type: boolean
       model:
-        description: "GitHub Models model id (publisher/model). Default openai/gpt-4o-mini."
+        description: "Copilot model ID or auto. Legacy openai/gpt-4o and openai/gpt-4o-mini map to auto."
         required: false
-        default: "openai/gpt-4o-mini"
+        default: "auto"
         type: string
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: write
       issues: write
-      models: read
+      copilot-requests: write
     steps:
       - name: Checkout caller repository
         uses: actions/checkout@v5
         with:
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Resolve governance pin
         id: pin
@@ -59,6 +62,7 @@ jobs:
       - name: Checkout governance at pin
         uses: actions/checkout@v5
         with:
+          persist-credentials: false
           repository: Malakof/.github
           path: .governance
           ref: ${{ steps.pin.outputs.version }}
@@ -66,28 +70,39 @@ jobs:
       - name: Install Python dependencies
         run: python3 -m pip install "PyYAML>=6.0"
 
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install pinned Copilot CLI
+        run: npm install --global @github/copilot@1.0.112
+
       - name: Run format check (PR)
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_MODELS_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          FORMAT_MODEL: ${{ inputs.model }}
+          FORMAT_BLOCKING: ${{ inputs.blocking }}
         run: |
           python3 .governance/scripts/format_check.py \
             --repo "${{ github.repository }}" \
             --pr "${{ github.event.pull_request.number }}" \
             --governance-root .governance \
-            --model "${{ inputs.model }}" \
-            --blocking "${{ inputs.blocking }}"
+            --model "$FORMAT_MODEL" \
+            --blocking "$FORMAT_BLOCKING"
 
       - name: Run format check (issue)
         if: github.event_name == 'issues'
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_MODELS_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          FORMAT_MODEL: ${{ inputs.model }}
+          FORMAT_BLOCKING: ${{ inputs.blocking }}
         run: |
           python3 .governance/scripts/format_check.py \
             --repo "${{ github.repository }}" \
             --issue "${{ github.event.issue.number }}" \
             --governance-root .governance \
-            --model "${{ inputs.model }}" \
-            --blocking "${{ inputs.blocking }}"
+            --model "$FORMAT_MODEL" \
+            --blocking "$FORMAT_BLOCKING"

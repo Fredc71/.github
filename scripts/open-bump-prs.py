@@ -21,6 +21,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import yaml
+
 PIN_FILENAME = ".crystal-governance.yaml"
 BRANCH_PREFIX = "chore/bump-governance-"
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -41,7 +43,8 @@ def bump_pr_body(version: str, workflow_changes: list[str]) -> str:
         "## Context\n\n"
         f"Automated propagation of the governed Crystal release `{version}`. "
         "The change updates `.crystal-governance.yaml` and reusable "
-        "`Malakof/.github` workflow refs when present.\n\n"
+        "`Malakof/.github` workflow refs when present. Shared format-check callers "
+        "also migrate to Copilot permissions and model routing.\n\n"
         "## Acceptance criteria\n\n"
         f"- governance pin equals `{version}`\n"
         f"- workflow refs updated: {updated_refs}\n"
@@ -109,6 +112,75 @@ def is_outdated(current: str | None, new: str) -> bool:
     return semver_tuple(current) < semver_tuple(new)
 
 
+def migrate_format_check_callers(content: str) -> str:
+    """Update only shared format-check jobs; retain other jobs and YAML comments."""
+    try:
+        document = yaml.compose(content)
+    except yaml.YAMLError:
+        raise ValueError("Invalid workflow YAML; migrate manually") from None
+
+    def entry(node, name):
+        if isinstance(node, yaml.MappingNode):
+            return next(((key, value) for key, value in node.value if key.value == name), (None, None))
+        return None, None
+
+    _, jobs = entry(document, "jobs")
+    if not isinstance(jobs, yaml.MappingNode):
+        return content
+    _, inherited = entry(document, "permissions")
+    lines = content.splitlines(keepends=True)
+    starts = [0]
+    for line in lines:
+        starts.append(starts[-1] + len(line))
+    edits = []
+    for job_key, job in jobs.value:
+        uses_key, uses = entry(job, "uses")
+        if not isinstance(uses, yaml.ScalarNode) or not uses.value.startswith(
+            "Malakof/.github/.github/workflows/format-check.yml@"
+        ):
+            continue
+        if job.flow_style:
+            raise ValueError("Inline format-check job requires a manual migration")
+        if job.start_mark.index < job_key.start_mark.index:
+            raise ValueError("Aliased format-check job requires a manual migration")
+        permission_key, permissions = entry(job, "permissions")
+        effective = permissions if permissions is not None else inherited
+        if not (isinstance(effective, yaml.ScalarNode) and effective.value == "write-all"):
+            values = {}
+            if isinstance(effective, yaml.MappingNode):
+                values = {key.value: value.value for key, value in effective.value}
+            elif effective is not None and effective.value != "read-all":
+                raise ValueError("Unsupported format-check permissions; migrate manually")
+            values.pop("models", None)
+            for name, access in {"contents": "read", "issues": "write", "pull-requests": "write"}.items():
+                values.setdefault(name, access)
+            values["copilot-requests"] = "write"
+            indent = " " * uses_key.start_mark.column
+            replacement = indent + "permissions:\n" + "".join(
+                indent + f"  {name}: {access}\n" for name, access in values.items()
+            )
+            if permission_key is None:
+                start = end = starts[uses_key.start_mark.line]
+            else:
+                start = starts[permission_key.start_mark.line]
+                # Inline maps and aliases occupy one line; block mappings end
+                # at the next sibling key. Never rewrite an anchor's source.
+                end_line = max(permission_key.start_mark.line + 1, permissions.end_mark.line)
+                if permissions.start_mark.index < permission_key.start_mark.index:
+                    end_line = permission_key.start_mark.line + 1
+                end = starts[end_line]
+            edits.append((start, end, replacement))
+        _, inputs = entry(job, "with")
+        model_key, model = entry(inputs, "model")
+        if isinstance(model, yaml.ScalarNode) and model.value in ("openai/gpt-4o", "openai/gpt-4o-mini"):
+            if model.start_mark.index < model_key.start_mark.index:
+                raise ValueError("Aliased legacy model requires a manual migration")
+            edits.append((model.start_mark.index, model.end_mark.index, "auto"))
+    for start, end, replacement in sorted(edits, reverse=True):
+        content = content[:start] + replacement + content[end:]
+    return content
+
+
 def bump_workflow_refs(repo_path: Path, new_version: str) -> list[str]:
     workflow_root = repo_path / ".github" / "workflows"
     if not workflow_root.exists():
@@ -117,10 +189,19 @@ def bump_workflow_refs(repo_path: Path, new_version: str) -> list[str]:
     for path in sorted(workflow_root.glob("*.yml")):
         content = path.read_text(encoding="utf-8")
         updated = WORKFLOW_REF_RE.sub(rf"\g<1>{new_version}", content)
+        updated = migrate_format_check_callers(updated)
         if updated != content:
             path.write_text(updated, encoding="utf-8")
             changed.append(str(path.relative_to(repo_path)))
     return changed
+
+
+def has_local_format_check_adapter(repo_path: Path) -> bool:
+    adapter = ".github/scripts/format_check_copilot.py"
+    return (repo_path / adapter).exists() and any(
+        adapter in path.read_text(encoding="utf-8")
+        for path in (repo_path / ".github/workflows").glob("*.yml")
+    )
 
 
 def sync_target_labels(repo: str) -> None:
@@ -144,6 +225,15 @@ def open_bump_pr(repo: str, new_version: str, dry_run: bool) -> dict[str, str]:
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp) / "repo"
         subprocess.run(["gh", "repo", "clone", repo, str(cwd), "--", "--depth=1"], check=True)
+        if has_local_format_check_adapter(cwd):
+            # The local Specs adapter imports the pinned script dynamically;
+            # new canonical imports are not compatible with that old wrapper.
+            # Switch back to the shared workflow in a reviewed migration first.
+            return {
+                "repo": repo,
+                "action": "manual-migration-required",
+                "reason": "Local format-check adapter detected; migrate it to the shared workflow before bumping the pin.",
+            }
         pin_path = cwd / PIN_FILENAME
         if pin_path.exists():
             content = pin_path.read_text(encoding="utf-8")
@@ -238,6 +328,8 @@ def main() -> int:
                 summary.append({"repo": repo, "action": "skipped", "current": current_pin})
                 continue
             summary.append(open_bump_pr(repo, args.new_version, args.dry_run))
+        except ValueError as exc:
+            summary.append({"repo": repo, "action": "error", "reason": str(exc)})
         except subprocess.CalledProcessError as exc:
             summary.append({
                 "repo": repo,

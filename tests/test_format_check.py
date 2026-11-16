@@ -3,141 +3,164 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+from pathlib import Path
+import subprocess
 import sys
 import unittest
-import urllib.error
-from pathlib import Path
 from unittest.mock import patch
 
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-import format_check
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'scripts'))
+import format_check as checker
+
+OK = {'pass': True, 'severity': 'ok', 'summary': 'Conforme', 'findings': []}
+FAIL = {'pass': False, 'severity': 'fail', 'summary': 'Missing priority',
+        'findings': [{'rule': 'priority', 'severity': 'fail', 'message': 'Missing label'}]}
 
 
-OK = {"pass": True, "severity": "ok", "summary": "Format reviewed", "findings": []}
-FAIL = {
-    "pass": False, "severity": "fail", "summary": "Missing priority",
-    "findings": [{"rule": "priority", "severity": "fail", "message": "Missing label"}],
-}
-
-
-def response(raw: bytes):
-    return io.BytesIO(raw)
-
-
-def envelope(verdict=OK):
-    return json.dumps({"choices": [{"message": {"content": json.dumps(verdict)}}]}).encode()
+def events(content, exit_code=0):
+    return '\n'.join(map(json.dumps, [
+        {'type': 'assistant.message', 'data': {'content': content}},
+        {'type': 'result', 'exitCode': exit_code},
+    ]))
 
 
 class FormatCheckTransportTests(unittest.TestCase):
-    def call(self, effects):
-        with patch.object(format_check.urllib.request, "urlopen", side_effect=effects) as request:
-            with patch("time.sleep"):
-                verdict = format_check.call_llm("private-token", "system", "private-prompt", "test/model")
-        return verdict, request.call_count
+    def setUp(self):
+        # The old implementation must fail these tests, never call a live API.
+        mock = patch('urllib.request.urlopen', side_effect=AssertionError('Retired transport called'))
+        mock.start()
+        self.addCleanup(mock.stop)
 
-    def test_empty_response_is_unavailable_after_bounded_retries(self):
-        verdict, count = self.call([response(b"") for _ in range(3)])
-        self.assertEqual(count, 3)
-        self.assertEqual(verdict["status"], "unavailable")
-        self.assertIsNone(verdict["pass"])
-        self.assertEqual(verdict["severity"], "warn")
-        self.assertIn("empty", verdict["findings"][0]["message"].lower())
+    def call(self, output=None, code=0, error=None, model='auto'):
+        result = subprocess.CompletedProcess([], code, output, 'private-token private-prompt')
+        with patch.object(checker.subprocess, 'run', return_value=result, side_effect=error) as run:
+            verdict = checker.call_llm('private-token', 'rules', 'private-prompt', model)
+        self.assertEqual(run.call_count, 1)
+        return verdict, run.call_args
 
-    def test_transient_invalid_response_recovers_without_changing_verdict(self):
-        verdict, count = self.call([response(b"<html>private-prompt</html>"), response(envelope())])
-        self.assertEqual(count, 2)
+    def test_valid_verdict_and_isolated_jsonl_invocation(self):
+        verdict, call = self.call(events(json.dumps(OK)))
         self.assertEqual(verdict, OK)
+        command = call.args[0]
+        self.assertEqual(command[command.index('--output-format') + 1], 'json')
+        self.assertEqual(command[command.index('--available-tools') + 1], '--disable-builtin-mcps')
+        self.assertIn('--no-custom-instructions', command)
+        self.assertNotIn('private-token', ' '.join(command))
+        self.assertNotIn('GH_TOKEN', call.kwargs['env'])
+        self.assertEqual(call.kwargs['env']['GITHUB_TOKEN'], 'private-token')
+        self.assertEqual(call.kwargs['timeout'], 180)
+        self.assertEqual(call.kwargs['cwd'], str(Path(call.kwargs['env']['COPILOT_HOME']).parent))
 
-    def test_invalid_payloads_never_become_a_successful_review(self):
-        invalid = [
-            b"<html>private-token private-prompt</html>", b"\xff", b"[]", b"{}",
-            b'{"choices": []}', b'{"choices": [{"message": {"content": "oops"}}]}',
-            envelope([]), envelope({**OK, "pass": "true"}),
-            envelope({**OK, "summary": ""}), envelope({**OK, "severity": "unknown"}),
-            envelope({**OK, "findings": ["private-prompt"]}),
-            envelope({**OK, "findings": [{"rule": "x", "severity": "fail", "message": "x"}]}),
-            envelope({**OK, "severity": "fail"}),
-        ]
-        for raw in invalid:
-            with self.subTest(raw=raw):
-                verdict, count = self.call([response(raw) for _ in range(3)])
-                self.assertEqual(count, 3)
-                self.assertEqual(verdict["status"], "unavailable")
-                self.assertIsNone(verdict["pass"])
-                diagnostic = json.dumps(verdict)
-                self.assertNotIn("private-token", diagnostic)
-                self.assertNotIn("private-prompt", diagnostic)
+    def test_legacy_model_ids_are_mapped_to_auto(self):
+        for model in ('openai/gpt-4o', 'openai/gpt-4o-mini'):
+            verdict, call = self.call(events(json.dumps(OK)), model=model)
+            command = call.args[0]
+            self.assertEqual(command[command.index('--model') + 1], 'auto')
+            self.assertEqual(verdict, OK)
 
-    def test_rate_limit_and_server_failure_are_retried(self):
-        for status in (408, 429, 500, 502, 503, 504):
-            with self.subTest(status=status):
-                error = urllib.error.HTTPError("https://example.invalid", status, "private-token", {}, io.BytesIO(b"private-prompt"))
-                verdict, count = self.call([error, response(envelope())])
-                self.assertEqual(verdict, OK)
-                self.assertEqual(count, 2)
+    def test_fenced_verdicts_and_escaped_line_breaks(self):
+        expected = dict(OK, summary='A long summary\nwith an intentional line break')
+        for opening in ('', '```json\n', '```\n'):
+            text = opening + json.dumps(expected) + ('\n```' if opening else '')
+            self.assertEqual(self.call(events(text))[0], expected)
 
-    def test_auth_failure_is_not_retried_or_disclosed(self):
-        error = urllib.error.HTTPError("https://example.invalid", 401, "private-token", {}, io.BytesIO(b"private-prompt"))
-        verdict, count = self.call([error])
-        self.assertEqual(count, 1)
-        self.assertEqual(verdict["status"], "unavailable")
-        self.assertIn("401", verdict["findings"][0]["message"])
-        self.assertNotIn("private", json.dumps(verdict))
+    def test_invalid_streams_never_claim_validation(self):
+        bad = ['', 'OK', '<html>private-prompt</html>', '[]',
+               json.dumps({'type': 'result', 'exitCode': 1}),
+               json.dumps({'type': 'assistant.message', 'data': {'content': json.dumps(OK)}}),
+               events('private-token private-prompt')]
+        for output in bad:
+            with self.subTest(output=output):
+                verdict, _ = self.call(output)
+                self.assertEqual(verdict['status'], 'unavailable')
+                self.assertIsNone(verdict['pass'])
+                self.assertNotIn('private', json.dumps(verdict))
 
-    def test_network_and_timeout_failures_are_bounded_and_redacted(self):
-        for error in (urllib.error.URLError("private-token"), TimeoutError("private-prompt")):
-            with self.subTest(error=type(error).__name__):
-                verdict, count = self.call([error] * 3)
-                self.assertEqual(count, 3)
-                self.assertEqual(verdict["status"], "unavailable")
-                self.assertNotIn("private", json.dumps(verdict))
+    def test_invalid_verdict_schema_is_unavailable(self):
+        bad = [[], {}, dict(OK, **{'pass': 'true'}), dict(OK, severity='unknown'),
+               dict(OK, severity=[]), dict(OK, summary=''), dict(OK, findings=[{}]),
+               dict(OK, severity='fail'), dict(OK, findings=FAIL['findings'])]
+        for value in bad:
+            with self.subTest(value=value):
+                verdict, _ = self.call(events(json.dumps(value)))
+                self.assertEqual(verdict['status'], 'unavailable')
 
-    def test_real_format_rejection_is_preserved_without_retry(self):
-        verdict, count = self.call([response(envelope(FAIL))])
-        self.assertEqual(verdict, FAIL)
-        self.assertEqual(count, 1)
+    def test_failed_call_or_timeout_is_redacted_and_not_retried(self):
+        for error in (None, subprocess.TimeoutExpired('private-prompt', 180), OSError('private-token'),
+                      UnicodeDecodeError('utf-8', b'private-token\xff', 13, 14, 'invalid byte')):
+            with self.subTest(error=error):
+                verdict, _ = self.call('private-prompt', code=1, error=error)
+                self.assertEqual(verdict['status'], 'unavailable')
+                self.assertNotIn('private', json.dumps(verdict))
 
-    def test_main_distinguishes_unavailable_from_validated_for_both_policies(self):
-        for blocking, expected_exit in (("false", 0), ("true", 1)):
+    def test_unexpected_tool_execution_or_session_error_cannot_pass(self):
+        for kind in ('tool.execution_start', 'session.error'):
+            output = json.dumps({'type': kind}) + '\n' + events(json.dumps(OK))
+            self.assertEqual(self.call(output)[0]['status'], 'unavailable')
+
+    def test_valid_format_rejection_is_preserved(self):
+        self.assertEqual(self.call(events(json.dumps(FAIL)))[0], FAIL)
+
+    def test_main_unavailable_fails_both_policies_and_never_claims_validation(self):
+        for blocking in ('false', 'true'):
             with self.subTest(blocking=blocking):
-                output = io.StringIO()
-                with contextlib.ExitStack() as stack:
-                    stack.enter_context(patch.object(sys, "argv", ["format_check.py", "--repo", "owner/repo", "--issue", "1", "--blocking", blocking]))
-                    stack.enter_context(patch.dict("os.environ", {"GH_MODELS_TOKEN": "private-token"}))
-                    stack.enter_context(patch.object(format_check, "fetch_artifact", return_value={"title": "example"}))
-                    stack.enter_context(patch.object(format_check, "load_governance", return_value={}))
-                    stack.enter_context(patch.object(format_check, "build_prompts", return_value=("system", "private-prompt")))
-                    stack.enter_context(patch.object(format_check.urllib.request, "urlopen", side_effect=[response(b"") for _ in range(3)]))
-                    stack.enter_context(patch("time.sleep"))
-                    comment = stack.enter_context(patch.object(format_check, "upsert_comment"))
-                    stack.enter_context(contextlib.redirect_stdout(output))
-                    self.assertEqual(format_check.main(), expected_exit)
-                rendered = comment.call_args.args[3]
-                self.assertIn("unavailable", rendered.lower())
-                self.assertNotIn("Validated against", rendered)
-                self.assertNotIn("Format check OK", output.getvalue())
-                self.assertNotIn("private", rendered + output.getvalue())
+                code, comment, output = self.main_case('', blocking)
+                self.assertEqual(code, 1)
+                self.assertIn('UNAVAILABLE', comment)
+                self.assertNotIn('Validated against', comment)
+                self.assertNotIn('Format check OK', output)
+                self.assertNotIn('private', comment + output)
+
+    def test_main_preserves_valid_advisory_and_blocking_rejections(self):
+        for blocking, expected in (('false', 0), ('true', 1)):
+            self.assertEqual(self.main_case(events(json.dumps(FAIL)), blocking)[0], expected)
+
+    def test_main_valid_success_names_copilot(self):
+        code, comment, output = self.main_case(events(json.dumps(OK)), 'false')
+        self.assertEqual(code, 0)
+        self.assertIn('via GitHub Copilot CLI', comment)
+        self.assertIn('Format check OK', output)
+
+    def main_case(self, output, blocking):
+        artifact = {'title': 'fix: repair format check', 'labels': [{'name': 'type:bug'}, {'name': 'priority:p2'}]}
+        result = subprocess.CompletedProcess([], 0, output, '')
+        stdout = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(sys, 'argv', ['format_check.py', '--repo', 'owner/repo', '--pr', '1', '--blocking', blocking, '--governance-root', str(ROOT)]))
+            stack.enter_context(patch.dict(os.environ, {'GITHUB_TOKEN': 'private-token'}, clear=True))
+            stack.enter_context(patch.object(checker, 'fetch_artifact', return_value=artifact))
+            stack.enter_context(patch.object(checker.subprocess, 'run', return_value=result))
+            comment = stack.enter_context(patch.object(checker, 'upsert_comment'))
+            stack.enter_context(contextlib.redirect_stdout(stdout))
+            code = checker.main()
+        return code, comment.call_args.args[3], stdout.getvalue()
 
 
 class FormatCheckWorkflowTests(unittest.TestCase):
-    def test_caller_checkout_precedes_pin_resolution_and_governance_checkout(self):
-        root = Path(__file__).resolve().parents[1]
-        workflow = yaml.safe_load((root / ".github/workflows/format-check.yml").read_text())
-        steps = workflow["jobs"]["check"]["steps"]
-        self.assertEqual(steps[0]["uses"], "actions/checkout@v5")
-        self.assertNotIn("repository", steps[0]["with"])
-        pin_index = next(i for i, step in enumerate(steps) if step.get("id") == "pin")
-        self.assertGreater(pin_index, 0)
-        self.assertIn(".crystal-governance.yaml", steps[pin_index]["run"])
-        governance = [(i, step) for i, step in enumerate(steps)
-                      if step.get("with", {}).get("repository") == "Malakof/.github"]
-        self.assertEqual(len(governance), 1)
-        index, checkout = governance[0]
-        self.assertGreater(index, pin_index)
-        self.assertEqual(checkout["with"]["ref"], "${{ steps.pin.outputs.version }}")
+    def test_checkout_order_permissions_and_token_transport(self):
+        workflow = yaml.safe_load((ROOT / '.github/workflows/format-check.yml').read_text())
+        job = workflow['jobs']['check']
+        steps = job['steps']
+        self.assertEqual(steps[0]['uses'], 'actions/checkout@v5')
+        self.assertFalse(steps[0]['with']['persist-credentials'])
+        pin = next(i for i, step in enumerate(steps) if step.get('id') == 'pin')
+        governance = next(i for i, step in enumerate(steps) if step.get('with', {}).get('repository') == 'Malakof/.github')
+        self.assertLess(0, pin)
+        self.assertLess(pin, governance)
+        self.assertEqual(steps[governance]['with']['ref'], '${{ steps.pin.outputs.version }}')
+        self.assertEqual(job['permissions']['copilot-requests'], 'write')
+        self.assertNotIn('models', job['permissions'])
+        self.assertTrue(any('@github/copilot@1.0.112' in step.get('run', '') for step in steps))
+        run_steps = [step for step in steps if 'scripts/format_check.py' in step.get('run', '')]
+        self.assertEqual(len(run_steps), 2)
+        for step in run_steps:
+            self.assertEqual(step['env']['GITHUB_TOKEN'], '${{ github.token }}')
+            self.assertNotIn('${{ inputs.model }}', step['run'])
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

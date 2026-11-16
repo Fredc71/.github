@@ -31,6 +31,10 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Install Python dependencies
+        if: steps.precheck.outputs.skip != 'true'
+        run: python3 -m pip install "PyYAML>=6.0"
+
       - name: Open bump PRs across Crystal repos
         if: steps.precheck.outputs.skip != 'true'
         env:
